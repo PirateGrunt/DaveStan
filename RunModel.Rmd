@@ -1,0 +1,181 @@
+---
+title: "Poisson Pareto Excess Model"
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(rstan)
+```
+
+The data is taken from something or other. There are just a handful of claims over 7 years.
+
+```{r }
+attachment <- 500
+
+dfClaims <- data.frame(Year = c(1994, 1995, 1996, 1996, 1997, 1998, 1999, 2000, 2000)
+                       , Severity = c(500, 350, 350, 500, 300, 600, 300, 400, 350)) %>% 
+  mutate(Excess = pmax(Severity - attachment, 0)
+         , ExcessCount = ifelse(Excess > 0, 1, 0))
+
+dfYear <- dfClaims %>% 
+  group_by(Year) %>% 
+  summarise(AggSeverity = sum(Severity)
+            , AggXS = sum(Excess)
+            , Frequency = n()
+            , ExcessFrequency = sum(ExcessCount))
+```
+
+## Fit frequency only
+
+Based on the data, we'll give a very rough idea of the prior distribution for the poisson parameter. We'll use a gamma for this. Below, is a plot of our prior.
+
+```{r }
+# Frequency only
+freqRate <- 28
+freqShape <- 36
+pltPriorFreq <- ggplot(data.frame(x = c(0, 4)), aes(x))
+pltPriorFreq <- pltPriorFreq + stat_function(fun = dgamma
+                                             , args = list(shape = freqShape, rate = freqRate)
+                                             , geom = "line")
+pltPriorFreq
+```
+
+And, after we run a stan model ...
+
+```{r }
+fitPois <- stan(file = 'Poisson.stan'
+                , data = list(numYears = length(dfYear$Year)
+                              , Frequency = dfYear$Frequency
+                              , freqShape = freqShape
+                              , freqRate = freqRate)
+                , iter = 1000
+                , seed = 1234)
+```
+
+... here's our posterior frequency distribution.
+
+```{r}
+postFreq <- extract(fitPois, 'lambda') %>% unlist()
+pltPostFreq <- ggplot(data.frame(postFreq), aes(postFreq)) + geom_density()
+pltPostFreq
+```
+
+And how many claims would we predict? About this many:
+
+```{r }
+claims <- extract(fitPois, 'proj_count') %>% unlist()
+pltClaims <- ggplot(as.data.frame(claims), aes(claims)) + geom_bar(fill = "grey")
+pltClaims
+summary(claims)
+```
+
+## Fit pareto
+
+We'll cheat a bit and use an exponential distribution for the severity. With a gamma prior, that gives us a Pareto type II. Or, at least that's what Markus Gesmann says: http://www.magesblog.com/2015/05/posterior-predictive-output-with-stan.html.
+
+```{r}
+sevRate <- 0.5
+sevShape <- 200
+pltPriorSev <- ggplot(data.frame(x = c(0, 800)), aes(x))
+pltPriorSev <- pltPriorSev + stat_function(fun = dgamma
+                                             , args = list(shape = sevShape, rate = sevRate)
+                                             , geom = "line")
+pltPriorSev
+```
+
+We'll use a scalar value of 10 for the number of new claims. This will allow us to declare a variable to house all the claims. With this, we can calculate the aggregate XS within Stan itself.
+
+```{r}
+fitPareto <- stan(file = 'Pareto.stan'
+                , data = list(numClaims = nrow(dfClaims)
+                              , Severity = dfClaims$Severity
+                              , sevShape = sevShape
+                              , sevRate = sevRate
+                              , newClaims = 10
+                              , attachment = attachment)
+                , iter = 1000
+                , seed = 1234)
+```
+
+```{r}
+agg_xs <- extract(fitPareto, 'agg_xs') %>% unlist()
+summary(agg_xs)
+
+proj_severity <- extract(fitPareto, 'proj_severity') %>% unlist()
+pltSeverity <- ggplot(data.frame(proj_severity), aes(proj_severity)) + geom_density(fill = "grey")
+pltSeverity
+summary(proj_severity)
+
+xs_severity <- extract(fitPareto, 'xs_severity') %>% unlist()
+
+pltXS <- ggplot(as.data.frame(xs_severity), aes(xs_severity)) + geom_density(fill = "grey")
+pltXS
+summary(xs_severity)
+
+proj_severity <- extract(fitPareto, 'proj_severity') %>% unlist()
+summary(proj_severity)
+
+sevTheta <- extract(fitPareto, 'sevTheta') %>% unlist()
+summary(sevTheta)
+```
+
+## Compound model
+
+```{r}
+fitPP <- stan(file = 'PoissonPareto.stan'
+                , data = list(numClaims = nrow(dfClaims)
+                              , Severity = dfClaims$Severity
+                              , sevShape = sevShape
+                              , sevRate = sevRate
+                              , newClaims = 10
+                              , attachment = attachment)
+                , iter = 1000
+                , seed = 1234)
+```
+
+
+If we try to run the simulation by using the number of claims to set the dimension of the pareto, we'll have an issue. 
+
+```
+non-data variables not allowed in dimension declarations.
+```
+
+We've got a few options here. For me, the easiest is to model things in two steps. First, we'll generate the ground-up claim count. With that, we'll build a vector of claims that's sufficiently large to ensure that we get enough claims for the aggregate. We've already done this before, so we can just pick up the results of our Poisson model. 
+
+We can also use the ParetoAgg stan model to give us a matrix of claims.
+
+```{r}
+fitPareto <- stan(file = 'Pareto.stan'
+                  , data = list(numClaims = nrow(dfClaims)
+                                , Severity = dfClaims$Severity
+                                , sevShape = sevShape
+                                , sevRate = sevRate)
+                  , seed = 1234)
+```
+
+```{r}
+
+```
+
+
+We only need to make sure that the `newClaims` variable in our Pareto model is at least as large as the max of the frequency results from Poisson.
+
+```{r}
+fitParetoAgg <- stan(file = 'ParetoAgg.stan'
+                      , data = list(numClaims = nrow(dfClaims)
+                                    , Severity = dfClaims$Severity
+                                    , sevShape = sevShape
+                                    , sevRate = sevRate
+                                    , newClaims = max(claims)
+                                    , attachment = attachment)
+                      , iter = 1000
+                      , seed = 1234)
+```
+
+We'll now have a matrix of claims.
+
+```{r}
+proj_severity <- extract(fitPareto, 'proj_severity')[[1]]
+```
+
