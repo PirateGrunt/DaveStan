@@ -8,7 +8,7 @@ library(ggplot2)
 library(rstan)
 ```
 
-The data is taken from something or other. There are just a handful of claims over 7 years.
+The data is taken from some short article that Dave sent me. There are just a handful of claims over 7 years. The article seems to refer to a larger set, but this will do for illustrative purposes.
 
 ```{r }
 attachment <- 500
@@ -84,7 +84,7 @@ pltPriorSev <- pltPriorSev + stat_function(fun = dgamma
 pltPriorSev
 ```
 
-We'll use a scalar value of 10 for the number of new claims. This will allow us to declare a variable to house all the claims. With this, we can calculate the aggregate XS within Stan itself.
+I've created two stan models for the severity. In one, I'm just fitting the severity. In another, I calculate an aggregate amount based on a fixed parameter for the number of claims. (More on this below.) In each case, I can also calculate the xs claim amount given an attachment point. This is pretty trivial and something I could easily have done in R once I get FGU results back.
 
 ```{r}
 fitPareto <- stan(file = 'Pareto.stan'
@@ -92,15 +92,16 @@ fitPareto <- stan(file = 'Pareto.stan'
                               , Severity = dfClaims$Severity
                               , sevShape = sevShape
                               , sevRate = sevRate
-                              , newClaims = 10
                               , attachment = attachment)
                 , iter = 1000
                 , seed = 1234)
 ```
 
+And here's what some output looks like. We'll see that the excess severity is highly skewed. I'm no expert, but I'd probably want to sample some more values.
+
 ```{r}
-agg_xs <- extract(fitPareto, 'agg_xs') %>% unlist()
-summary(agg_xs)
+sevTheta <- extract(fitPareto, 'sevTheta') %>% unlist()
+summary(sevTheta)
 
 proj_severity <- extract(fitPareto, 'proj_severity') %>% unlist()
 pltSeverity <- ggplot(data.frame(proj_severity), aes(proj_severity)) + geom_density(fill = "grey")
@@ -113,17 +114,13 @@ pltXS <- ggplot(as.data.frame(xs_severity), aes(xs_severity)) + geom_density(fil
 pltXS
 summary(xs_severity)
 
-proj_severity <- extract(fitPareto, 'proj_severity') %>% unlist()
-summary(proj_severity)
-
-sevTheta <- extract(fitPareto, 'sevTheta') %>% unlist()
-summary(sevTheta)
+tail(sort(xs_severity))
 ```
 
-## Compound model
+For the aggregate, we'll use a scalar value of 10 for the number of new claims. This will allow us to declare a variable to house all the claims. With this, we can calculate the aggregate XS within Stan itself.
 
 ```{r}
-fitPP <- stan(file = 'PoissonPareto.stan'
+fitParetoAgg <- stan(file = 'ParetoAgg.stan'
                 , data = list(numClaims = nrow(dfClaims)
                               , Severity = dfClaims$Severity
                               , sevShape = sevShape
@@ -134,32 +131,51 @@ fitPP <- stan(file = 'PoissonPareto.stan'
                 , seed = 1234)
 ```
 
+```{r}
+agg_xs <- extract(fitParetoAgg, 'agg_xs') %>% unlist()
+summary(agg_xs)
+pltAggXS <- ggplot(as.data.frame(agg_xs), aes(agg_xs)) + geom_density(fill = "grey")
+pltAggXS
+```
 
-If we try to run the simulation by using the number of claims to set the dimension of the pareto, we'll have an issue. 
+## Collective risk model
+
+It'd be real cool if we could do a collective risk model, where the number of claims is a random variable. If we try the stan code below, we'll have a problem.
+
+```{r error=TRUE}
+fitPP <- stan(file = 'PoissonPareto.stan'
+                , data = list(numClaims = nrow(dfClaims)
+                              , Severity = dfClaims$Severity
+                              , sevShape = sevShape
+                              , sevRate = sevRate
+                              , attachment = attachment)
+                , iter = 1000
+                , seed = 1234)
+```
+
+
+We'll get an error like the one below.
 
 ```
 non-data variables not allowed in dimension declarations.
 ```
 
+This is because we can't declare a vector with a random length.
+
 We've got a few options here. For me, the easiest is to model things in two steps. First, we'll generate the ground-up claim count. With that, we'll build a vector of claims that's sufficiently large to ensure that we get enough claims for the aggregate. We've already done this before, so we can just pick up the results of our Poisson model. 
 
-We can also use the ParetoAgg stan model to give us a matrix of claims.
-
 ```{r}
-fitPareto <- stan(file = 'Pareto.stan'
-                  , data = list(numClaims = nrow(dfClaims)
-                                , Severity = dfClaims$Severity
-                                , sevShape = sevShape
-                                , sevRate = sevRate)
-                  , seed = 1234)
+proj_severity <- extract(fitPareto, 'proj_severity') %>% unlist()
+proj_severity <- proj_severity[1:(sum(claims))]
+
+sim <- mapply(function(simNum, numClaims){
+ if (numClaims == 0) simNum 
+}, simNum = seq.int(length(claims)), numClaims = claims) %>% unlist()
+
+dfSim <- data.frame()
 ```
 
-```{r}
-
-```
-
-
-We only need to make sure that the `newClaims` variable in our Pareto model is at least as large as the max of the frequency results from Poisson.
+As a second option, we can use the ParetoAgg stan model to give us a matrix of claims. We need to make sure that the `newClaims` variable in our Pareto model is at least as large as the max of the frequency results from Poisson. In this case it is, but let's run it again to be sure.
 
 ```{r}
 fitParetoAgg <- stan(file = 'ParetoAgg.stan'
@@ -173,9 +189,41 @@ fitParetoAgg <- stan(file = 'ParetoAgg.stan'
                       , seed = 1234)
 ```
 
-We'll now have a matrix of claims.
+We'll now have a matrix of claims. We can translate this into an aggregate distribution in one of a few ways. Here's the most straightforsward to program, if not the most efficient. We'll create a list object wherein each item has two elements: the number of claims and a vector of amounts. We can summarize the list pretty easily.
 
 ```{r}
-proj_severity <- extract(fitPareto, 'proj_severity')[[1]]
+dfSeverity <- extract(fitParetoAgg, 'proj_severity')[[1]] %>% as.matrix()
+# colnames(dfSeverity) <- seq.int(ncol(dfSeverity))
 ```
 
+```{r}
+lstSim <- vector(mode = "list", length(claims))
+lstItem <- list()
+for (i in seq_along(claims)){
+  lstItem$Frequency <- claims[i]
+  if (claims[i] > 0){
+    lstItem$Severity <- dfSeverity[i, seq.int(claims[i])]
+    lstItem$XS_Severity <- pmax(lstItem$Severity - attachment, 0)
+    lstItem$AggXS <- sum(lstItem$XS_Severity)
+  } else {
+    lstItem$Severity <- NA_real_
+    lstItem$XS_Severity <- NA_real_
+    lstItem$AggXS <- 0
+  }
+  lstSim[[i]] <- lstItem
+}
+
+agg_xs <- sapply(lstSim, "[[", "AggXS")
+summary(agg_xs)
+pltAggXS <- ggplot(as.data.frame(agg_xs), aes(agg_xs)) + geom_density(fill = "grey")
+pltAggXS
+```
+
+```{r eval=FALSE}
+dfSeverity$Sim <- seq.int(nrow(dfSeverity))
+dfSeverity <- tidyr::gather(dfSeverity, key = Sim, -Sim)
+```
+
+A third and, kinda complicated, way to do it would be to get the Agg stan model as many times as we have potential claims. We'd get an aggregate amount for each run which we could weight by the probability of each frequency.
+
+A fourth option could be to create a function within Stan.
